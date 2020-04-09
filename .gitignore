@@ -31,3 +31,4 @@
 *.out
 *.app
 /.vs/SoftlyPlay/v16/Browse.VC.opendb
+.vs/
