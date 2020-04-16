@@ -1,17 +1,16 @@
 #include "audioUtil.h"
 
 
-#include <iostream>
-#include <string>
+
 #include <list>
 #include <memory>
 #include <chrono>
-#include <thread>
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
-#include <cstdlib>
-#include <tuple>
+
+
 
 using std::condition_variable;
 using std::cout;
@@ -44,8 +43,7 @@ class MediaProcessor {
       auto prepareTime = std::chrono::system_clock::now();
       std::chrono::duration<double> diff = prepareTime - lastPrepareTime;
       lastPrepareTime = prepareTime;
-      // cout << "+++++++++++  PrepareNextData, index="<< streamIndex <<",
-      // prepare intervalTime=" << (diff.count() * 1000) << "ms" <<endl;
+
       prepareNextData();
     }
     cout << "[THREAD] next frame keeper finished, index=" << streamIndex
@@ -113,7 +111,6 @@ class MediaProcessor {
       if (ret == 0) {
         av_packet_free(&targetPkt);
         targetPkt = nullptr;
-        // cout << "[AUDIO] avcodec_send_packet success." << endl;
       } else if (ret == AVERROR(EAGAIN)) {
         // buff full, can not decode any more, nothing need to do.
         // keep the packet for next time decode.
@@ -130,8 +127,6 @@ class MediaProcessor {
 
       ret = avcodec_receive_frame(codecCtx, nextFrame);
       if (ret == 0) {
-        // cout << "avcodec_receive_frame success." << endl;
-        // success.
         generateNextData(nextFrame);
         isNextDataReady.store(true);
       } else if (ret == AVERROR_EOF) {
@@ -204,6 +199,8 @@ class MediaProcessor {
     return need;
   }
 
+  AVCodecContext* getCodecCtx() { return codecCtx; }
+
   uint64_t getPts() { return currentTimestamp.load(); }
 };
 
@@ -227,6 +224,7 @@ class AudioProcessor : public MediaProcessor {
     }
     std::tie(outSamples, outDataSize) = reSampler->reSample(outBuffer, outBufferSize, frame);
     auto t = frame->pts * av_q2d(streamTimeBase) * 1000;
+    cout << "at: " << t << "64: " << frame->pts << endl;
     nextFrameTimestamp.store((uint64_t)t);
   }
 
@@ -249,6 +247,7 @@ class AudioProcessor : public MediaProcessor {
       cout << "WARN: can not find audio stream." << endl;
     }
 
+    streamTimeBase = formatCtx->streams[streamIndex]->time_base;
 
     int64_t inLayout = codecCtx->channel_layout;
     int inSampleRate = codecCtx->sample_rate;
@@ -290,23 +289,8 @@ class AudioProcessor : public MediaProcessor {
     cv.notify_one();
   }
 
-  int getInChannels() const {
-    if (codecCtx != nullptr) {
-      return codecCtx->channels;
-    } else {
-      throw std::runtime_error("can not getChannels.");
-    }
-  }
 
   int getOutChannels() const { return outAudio.channels; }
-
-  int getInChannleLayout() const {
-    if (codecCtx != nullptr) {
-      return codecCtx->channel_layout;
-    } else {
-      throw std::runtime_error("can not getChannleLayout.");
-    }
-  }
 
   int getOutChannleLayout() const { return outAudio.layout; }
 
@@ -320,13 +304,7 @@ class AudioProcessor : public MediaProcessor {
 
   int getOutSampleRate() const { return outAudio.sampleRate; }
 
-  int getSampleFormat() const {
-    if (codecCtx != nullptr) {
-      return (int)codecCtx->sample_fmt;
-    } else {
-      throw std::runtime_error("can not getSampleRate.");
-    }
-  }
+
 };
 
 class VideoProcessor : public MediaProcessor {
@@ -336,6 +314,7 @@ class VideoProcessor : public MediaProcessor {
  protected:
   void generateNextData(AVFrame* frame) override {
     auto t = frame->pts * av_q2d(streamTimeBase) * 1000;
+    cout << "vt: " << t << "64: " << frame->pts << endl;
     nextFrameTimestamp.store((uint64_t)t);
     sws_scale(sws_ctx, (uint8_t const* const*)frame->data, frame->linesize, 0,
               codecCtx->height, outPic->data, outPic->linesize);
@@ -366,6 +345,7 @@ class VideoProcessor : public MediaProcessor {
       cout << "WARN: can not find video stream." << endl;
     }
 
+    streamTimeBase = formatCtx->streams[streamIndex]->time_base;
 
     int w = codecCtx->width;
     int h = codecCtx->height;
@@ -401,22 +381,6 @@ class VideoProcessor : public MediaProcessor {
     } else {
       cv.notify_one();
       return false;
-    }
-  }
-
-  int getWidth() const {
-    if (codecCtx != nullptr) {
-      return codecCtx->width;
-    } else {
-      throw std::runtime_error("can not getWidth.");
-    }
-  }
-
-  int getHeight() const {
-    if (codecCtx != nullptr) {
-      return codecCtx->height;
-    } else {
-      throw std::runtime_error("can not getHeight.");
     }
   }
 

@@ -9,7 +9,7 @@
 #include <string>
 #include <stdio.h>
  
-#define __STDC_CONSTANT_MACROS
+
 
 #ifdef _WIN32
 // Windows

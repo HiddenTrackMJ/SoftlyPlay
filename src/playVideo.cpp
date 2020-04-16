@@ -16,22 +16,33 @@ using std::string;
 
 namespace video {
 int thread_quit = 0;
+std::atomic<bool> faster{false};
 char errors[1024];
 int video_stream_index = -1;
 int audio_stream_index = -1;
 
 int refresh_thread(void* opaque) {
+  double* frame_rate = (double*)opaque;
   thread_quit = 0;
   while (!thread_quit) {
     SDL_Event event;
     event.type = REFRESH_EVENT;
     SDL_PushEvent(&event);
-    SDL_Delay(30);
+    if (faster.load()) {
+      //cout << "play faster" << endl;
+      SDL_Delay((int)(1000 / *frame_rate) / 2);
+    }
+     
+    else {
+      //cout << "play normaly" << endl;
+      SDL_Delay((int)(1000 / *frame_rate));
+    }
+      
   }
- /* thread_quit = 0;
+  thread_quit = 0;
   SDL_Event event;
   event.type = BREAK_EVENT;
-  SDL_PushEvent(&event);*/
+  SDL_PushEvent(&event);
   return 0;
 }
 
@@ -208,6 +219,9 @@ void playAudio(AVFormatContext* fmt_ctx, AVCodecContext* acodec_ctx,
 
   SDL_AudioSpec audio_spec;
   SDL_AudioSpec spec;
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
   // set audio settings from codec info
   audio_spec.freq = acodec_ctx->sample_rate;
   audio_spec.format = AUDIO_S16SYS;
@@ -246,13 +260,12 @@ void playAudio(AVFormatContext* fmt_ctx, AVCodecContext* acodec_ctx,
 
 }
 
-void playVideo(AVCodecContext* vcodec_ctx,
-               VideoProcessor& vProcessor) {
+void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
+               AudioProcessor* audio = nullptr) {
   int ret = 0;
   AVFrame* frame = av_frame_alloc();
-  AVPicture* pic = nullptr;
   AVPacket* pkt = av_packet_alloc();
-  struct SwsContext* sws_ctx = nullptr;
+
   // for render
   int quit = 1;
   int w_width = vcodec_ctx->width;
@@ -262,16 +275,12 @@ void playVideo(AVCodecContext* vcodec_ctx,
   SDL_Renderer* render = nullptr;
   SDL_Texture* texture = nullptr;
   SDL_Event event;
-  SDL_Rect rect;
   SDL_Thread* video_thread;
-  rect.x = 0;
-  rect.y = 0;
-  rect.w = w_width;
-  rect.h = w_height;
+
 
 
   window = SDL_CreateWindow("Softly Spoken", SDL_WINDOWPOS_CENTERED,
-                            SDL_WINDOWPOS_CENTERED, w_width, w_height,
+                            SDL_WINDOWPOS_CENTERED, w_width / 2, w_height / 2,
                             SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
 
   if (!window) {
@@ -292,17 +301,10 @@ void playVideo(AVCodecContext* vcodec_ctx,
     throw "Failed to create a texture!";
   }
 
-  // init SWS ctx for software scaling
-  sws_ctx = sws_getContext(vcodec_ctx->width, vcodec_ctx->height,
-                           vcodec_ctx->pix_fmt, w_width, w_height,
-                           AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
-
-  pkt = (AVPacket*)av_malloc(sizeof(AVPacket));
-  pic = (AVPicture*)malloc(sizeof(AVPicture));
-  avpicture_alloc(pic, AV_PIX_FMT_YUV420P, vcodec_ctx->width,
-                  vcodec_ctx->height);
-
-  video_thread = SDL_CreateThread(refresh_thread, NULL, NULL);
+  auto frame_rate = vProcessor.getFrameRate();
+  
+  cout << "fr1: " << frame_rate << "fr2: " << (int)(1000 / frame_rate) << endl;
+  video_thread = SDL_CreateThread(refresh_thread, "Refresh", &frame_rate);
 
   // read frames and save first five frames to disk
   int frameFinished = 0;
@@ -342,25 +344,44 @@ void playVideo(AVCodecContext* vcodec_ctx,
       //    av_packet_unref(pkt);
       //  }
       //}
+
+       if (vProcessor.isStreamFinished()) {
+        thread_quit = true;
+        continue;  // skip REFRESH event.
+      }
+
+      if (audio != nullptr) {
+        auto vTs = vProcessor.getPts();
+        auto aTs = audio->getPts();
+        //cout << "vTs: " << vTs << "aTs: " << aTs << endl;
+        if (vTs > aTs && vTs - aTs > 30) {
+          cout << "VIDEO FASTER ================= vTs - aTs [" << (vTs - aTs)
+               << "]ms, SKIP A EVENT" << endl;
+          // skip a REFRESH_EVENT
+          faster.store(false);
+          slowCount++;
+          continue;
+        } else if (vTs < aTs && aTs - vTs > 30) {
+          cout << "VIDEO SLOWER ================= aTs - vTs =[" << (aTs - vTs)
+               << "]ms, Faster" << endl;
+          faster.store(true);
+          fastCount++;
+        } else {
+          faster.store(false);
+        }
+      } else
+        cout << "no audio processor" << endl;
+
       AVFrame* frame = vProcessor.getFrame();
 
       if (frame != nullptr) {
-        SDL_UpdateYUVTexture(
-            texture,  // the texture to update
-            NULL,     // a pointer to the rectangle of pixels to update, or
-                      // NULL to update the entire texture
-            frame->data[0],      // the raw pixel data for the Y plane
-            frame->linesize[0],  // the number of bytes between rows of pixel
-                                 // data for the Y plane
-            frame->data[1],      // the raw pixel data for the U plane
-            frame->linesize[1],  // the number of bytes between rows of pixel
-                                 // data for the U plane
-            frame->data[2],      // the raw pixel data for the V plane
-            frame->linesize[2]   // the number of bytes between rows of pixel
-                                 // data for the V plane
+        SDL_UpdateYUVTexture(texture, NULL,
+                             frame->data[0], frame->linesize[0],
+                             frame->data[1], frame->linesize[1],
+                             frame->data[2], frame->linesize[2]
         );
         SDL_RenderClear(render);
-        SDL_RenderCopy(render, texture, NULL, &rect);
+        SDL_RenderCopy(render, texture, NULL, NULL);
         SDL_RenderPresent(render);
         if (!vProcessor.refreshFrame()) {
           cout << "WARN: vProcessor.refreshFrame false" << endl;
@@ -380,10 +401,7 @@ void playVideo(AVCodecContext* vcodec_ctx,
     }
   }
 _Quit:
-  sws_freeContext(sws_ctx);
   av_frame_free(&frame);
-  avpicture_free(pic);
-  free(pic);
   av_packet_free(&pkt);
 
   if (!texture) SDL_DestroyTexture(texture);
@@ -400,9 +418,6 @@ int play_video(string path) {
 
   AVCodecParameters* acodec_par = nullptr;
   AVCodecContext* acodec_ctx = nullptr;
-  
-  // uint8_t* out_buffer = nullptr;
-  // Unit32 pix_fmt;
 
   av_log_set_level(AV_LOG_INFO);
 
@@ -465,13 +480,11 @@ int play_video(string path) {
                           std::ref(audioDeviceID), std::ref(audioProcessor));
   audioThread.join();
 
-  std::thread videoThread(playVideo, vcodec_ctx, std::ref(videoProcessor));
+  std::thread videoThread(playVideo, vcodec_ctx, std::ref(videoProcessor),
+                          &audioProcessor);
 
   videoThread.join();
 
-   
-
- 
 
   //SDL_Delay(30000);
   SDL_PauseAudioDevice(audioDeviceID, 1);

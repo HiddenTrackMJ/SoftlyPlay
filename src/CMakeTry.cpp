@@ -33,7 +33,7 @@ int main(int argc, char *argv[]) {
   cout << "j: " << j << " &j: " << &j << endl;
   //return 0;
 
-  string path = "D:/Download/Videos/LadyLiu/PhumViphurit-SoftlySpoken.mp4";
+  string path = "http://vfx.mtime.cn/Video/2019/03/21/mp4/190321153853126488.mp4";
   //int ret = play_audio(path);
   int ret = -1; 
   try {
