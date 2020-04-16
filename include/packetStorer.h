@@ -224,7 +224,7 @@ class AudioProcessor : public MediaProcessor {
     }
     std::tie(outSamples, outDataSize) = reSampler->reSample(outBuffer, outBufferSize, frame);
     auto t = frame->pts * av_q2d(streamTimeBase) * 1000;
-    cout << "at: " << t << "64: " << frame->pts << endl;
+    //cout << "at: " << t << "64: " << frame->pts << endl;
     nextFrameTimestamp.store((uint64_t)t);
   }
 
@@ -314,7 +314,7 @@ class VideoProcessor : public MediaProcessor {
  protected:
   void generateNextData(AVFrame* frame) override {
     auto t = frame->pts * av_q2d(streamTimeBase) * 1000;
-    cout << "vt: " << t << "64: " << frame->pts << endl;
+    //cout << "vt: " << t << "64: " << frame->pts << endl;
     nextFrameTimestamp.store((uint64_t)t);
     sws_scale(sws_ctx, (uint8_t const* const*)frame->data, frame->linesize, 0,
               codecCtx->height, outPic->data, outPic->linesize);

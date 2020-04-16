@@ -220,7 +220,7 @@ void playAudio(AVFormatContext* fmt_ctx, AVCodecContext* acodec_ctx,
   SDL_AudioSpec audio_spec;
   SDL_AudioSpec spec;
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
   // set audio settings from codec info
   audio_spec.freq = acodec_ctx->sample_rate;
@@ -355,15 +355,15 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
         auto aTs = audio->getPts();
         //cout << "vTs: " << vTs << "aTs: " << aTs << endl;
         if (vTs > aTs && vTs - aTs > 30) {
-          cout << "VIDEO FASTER ================= vTs - aTs [" << (vTs - aTs)
-               << "]ms, SKIP A EVENT" << endl;
+          cout << "VIDEO IS FASTER ================= " << (vTs - aTs)
+               << "ms, SKIP A EVENT" << endl;
           // skip a REFRESH_EVENT
           faster.store(false);
           slowCount++;
           continue;
         } else if (vTs < aTs && aTs - vTs > 30) {
-          cout << "VIDEO SLOWER ================= aTs - vTs =[" << (aTs - vTs)
-               << "]ms, Faster" << endl;
+          cout << "VIDEO IS SLOWER ================= " << (aTs - vTs)
+               << "ms, Faster" << endl;
           faster.store(true);
           fastCount++;
         } else {
@@ -490,13 +490,9 @@ int play_video(string path) {
   SDL_PauseAudioDevice(audioDeviceID, 1);
   SDL_CloseAudio();
 
-   bool r;
-  r = audioProcessor.close();
-  cout << "audioProcessor closed: " << r << endl;
-  r = videoProcessor.close();
-  cout << "videoProcessor closed: " << r << endl;
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  audioProcessor.close();
+  videoProcessor.close();
 
   readerThread.join();
    
