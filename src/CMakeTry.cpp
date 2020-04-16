@@ -15,27 +15,32 @@ extern int play_audio(string);
 
 }
 
-int thread_exit = 0;
-// Thread
-int sfp_refresh_thread(void *opaque) {
-  SDL_Event event;
-  while (thread_exit == 0) {
-    event.type = SFM_REFRESH_EVENT;
-    SDL_PushEvent(&event);
-    // Wait 40 ms
-    SDL_Delay(40);
-  }
-  return 0;
-}
+void change1(int& j) { j = j + 1; }
+void change2(int* j) { *j = *j + 1; }
+void change3(int** j) { **j = **j + 1; }
+
 
 #undef main
 int main(int argc, char *argv[]) {
   using namespace video;
   using namespace audio;
+  int j = 1;
+  int *i = &j;
+  cout << "j: " << j << " &j: " << &j << endl;
+  change1(j);
+  cout << "j: " << j << " &j: " << &j << endl;
+  change2(i);
+  cout << "j: " << j << " &j: " << &j << endl;
+  //return 0;
 
   string path = "D:/Download/Videos/LadyLiu/PhumViphurit-SoftlySpoken.mp4";
   //int ret = play_audio(path);
-  int ret = play_video(path);
+  int ret = -1; 
+  try {
+    ret = play_video(path);
+  } catch (const std::runtime_error &e) {
+    std::cout << e.what();
+  }
   return ret;
 
    

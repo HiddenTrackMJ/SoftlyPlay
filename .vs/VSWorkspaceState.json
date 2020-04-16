@@ -2,10 +2,8 @@
   "ExpandedNodes": [
     "",
     "\\include",
-    "\\out",
-    "\\out\\build",
     "\\src"
   ],
-  "SelectedNode": "\\CMakeLists.txt",
+  "SelectedNode": "\\include\\audioUtil.h",
   "PreviewInSolutionExplorer": false
 }

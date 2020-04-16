@@ -1,10 +1,23 @@
 #include "CMakeTry.h"
+#if defined(_MSC_VER)
+#include <al.h>
+#include <alc.h> 
+#elif defined(__APPLE__)
+#include <OpenAL/al.h>
+#include <OpenAL/alc.h>
+#else
+#include <AL/al.h>   
+#include <AL/alc.h>  
+#endif
+
+
 
 using std::cout;
 using std::endl;
 using std::string;
 
 namespace audio {
+
 int play_audio(string path) {
   int ret = 0;
   int audio_index = 0;
@@ -34,7 +47,7 @@ int play_audio(string path) {
   }
   audio_index = ret;
   av_init_packet(&pkt);
-  cout << pkt.stream_index << " km sss" << endl;
+
   while (av_read_frame(fmt_ctx, &pkt) >= 0) {
     if (pkt.stream_index == audio_index) {
       

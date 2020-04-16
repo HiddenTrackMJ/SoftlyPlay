@@ -50,7 +50,11 @@ message(PROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR})
 
 
 # 将源代码添加到此项目的可执行文件。
-add_executable (${PROJECT_NAME} "src/CMakeTry.cpp" "src/playAudio.cpp" "src/playVideo.cpp")
+add_executable (${PROJECT_NAME} 
+"src/CMakeTry.cpp" 
+"src/playAudio.cpp" 
+"src/playVideo.cpp" 
+)
 
 target_include_directories( ${PROJECT_NAME}  
 	PRIVATE 

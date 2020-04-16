@@ -19,6 +19,7 @@ extern "C" {
 #include "libavformat/avformat.h"
 #include "libavutil/imgutils.h"
 #include "libswscale/swscale.h"
+    #include "libswresample/swresample.h"
 };
 #else
 // Linux...
@@ -40,6 +41,5 @@ extern "C" {
 #define OUTPUT_YUV420P 0
 
 
-#define SFM_REFRESH_EVENT (SDL_USEREVENT + 1)
 
 
