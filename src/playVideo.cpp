@@ -1,5 +1,5 @@
 #include "CMakeTry.h"
-#include "audioUtil.h"
+#include "FFmpegUtil.h"
 #include "packetStorer.h"
 
 extern "C" {
@@ -49,17 +49,17 @@ int refresh_thread(void* opaque) {
 struct AudioData {
   AVFormatContext* fmt_ctx;
   AVCodecContext* codec_ctx;
-  AudioUtil::ReSampler* reSmapler;
+  FFmpegUtil::ReSampler* reSmapler;
 };
 
 void audioCallback(void* userdata, Uint8* stream, int len) {
-  AudioProcessor* receiver = (AudioProcessor*)userdata;
-  receiver->writeAudioData(stream, len);
+  AudioDealer* receiver = (AudioDealer*)userdata;
+  receiver->write_audio_data(stream, len);
 }
 
 void audio_callback(void* userdata, Uint8* stream, int len) {
   AudioData* audioData = (AudioData*)userdata;
-  AudioUtil::ReSampler* reSampler = audioData->reSmapler;
+  FFmpegUtil::ReSampler* reSampler = audioData->reSmapler;
 
   static uint8_t* outBuffer = nullptr;
   static int outBufferSize = 0;
@@ -151,7 +151,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
 
 
-int getPkt(AVFormatContext* fmt_ctx, AVPacket* pkt) {
+int get_packet(AVFormatContext* fmt_ctx, AVPacket* pkt) {
   while (true) {
     if (av_read_frame(fmt_ctx, pkt) >= 0) {
       return pkt->stream_index;
@@ -162,33 +162,32 @@ int getPkt(AVFormatContext* fmt_ctx, AVPacket* pkt) {
   }
 }
 
-void pktReader(AVFormatContext* fmt_ctx, AudioProcessor* aProcessor,
-               VideoProcessor* vProcessor) {
+void packet_grabber(FFmpegUtil::ffmpeg_util f, AudioDealer* ad,
+               VideoDealer* vd) {
   const int CHECK_PERIOD = 10;
 
-  cout << "INFO: pkt Reader thread started." << endl;
-  int audioIndex = aProcessor->getAudioIndex();
-  int videoIndex = vProcessor->getVideoIndex();
+  auto fmt_ctx = f.get_fmt_ctx();
+  int audio_index = f.get_audio_index();
+  int video_index = f.get_video_index();
 
-  while ( !aProcessor->isClosed() &&
-         !vProcessor->isClosed()) {
-    while (aProcessor->needPacket() || vProcessor->needPacket()) {
+  while ( !ad->isClosed() && !vd->isClosed() && !thread_quit) {
+    while (ad->needPacket() || vd->needPacket()) {
       AVPacket* packet = (AVPacket*)av_malloc(sizeof(AVPacket));
-      int t = getPkt(fmt_ctx, packet);
+      int t = get_packet(fmt_ctx, packet);
       if (t == -1) {
         cout << "INFO: file finish." << endl;
-        aProcessor->pushPkt(nullptr);
-        vProcessor->pushPkt(nullptr);
+        ad->pushPkt(nullptr);
+        vd->pushPkt(nullptr);
         break;
-      } else if (t == audioIndex && aProcessor != nullptr) {
+      } else if (t == audio_index && ad != nullptr) {
         unique_ptr<AVPacket> uPacket(packet);
-        aProcessor->pushPkt(std::move(uPacket));
-      } else if (t == videoIndex && vProcessor != nullptr) {
+        ad->pushPkt(std::move(uPacket));
+      } else if (t == video_index && vd != nullptr) {
         unique_ptr<AVPacket> uPacket(packet);
-        vProcessor->pushPkt(std::move(uPacket));
+        vd->pushPkt(std::move(uPacket));
       } else {
         av_packet_free(&packet);
-        cout << "WARN: unknown streamIndex: [" << t << "]" << endl;
+        //cout << "WARN: unknown streamIndex: [" << t << "]" << endl;
       }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_PERIOD));
@@ -196,24 +195,23 @@ void pktReader(AVFormatContext* fmt_ctx, AudioProcessor* aProcessor,
   cout << "[THREAD] INFO: pkt Reader thread finished." << endl;
 }
 
-void playAudio(AVFormatContext* fmt_ctx, AVCodecContext* acodec_ctx,
-               SDL_AudioDeviceID& audioDeviceID, AudioProcessor& aProcessor) {
+void playAudio(FFmpegUtil::ffmpeg_util f, SDL_AudioDeviceID& audioDeviceID, AudioDealer& aProcessor) {
   // for audio play
+  auto fmt_ctx = f.get_fmt_ctx();
+  auto acodec_ctx = f.get_acodec_ctx();
   int64_t in_layout = acodec_ctx->channel_layout;
   int in_channels = acodec_ctx->channels;
   int in_sample_rate = acodec_ctx->sample_rate;
   AVSampleFormat in_sample_fmt = AVSampleFormat(acodec_ctx->sample_fmt);
 
-  cout << "in sr: " << in_sample_rate << "in sf: " << in_sample_fmt << endl;
-  AudioUtil::AudioInfo inAudio(in_layout, in_sample_rate, in_channels,
+  cout << "in sr: " << in_sample_rate << " in sf: " << in_sample_fmt << endl;
+  FFmpegUtil::AudioInfo inAudio(in_layout, in_sample_rate, in_channels,
                                in_sample_fmt);
-  AudioUtil::AudioInfo outAudio =
-      // AudioUtil::AudioInfo(AV_CH_LAYOUT_STEREO, in_sample_fmt, 2,
-      // AV_SAMPLE_FMT_S16);
-      AudioUtil::ReSampler::getDefaultAudioInfo(in_sample_rate);
+
+  FFmpegUtil::AudioInfo outAudio = FFmpegUtil::ReSampler::getDefaultAudioInfo(in_sample_rate);
   outAudio.sampleRate = inAudio.sampleRate;
 
-  AudioUtil::ReSampler reSampler(inAudio, outAudio);
+  FFmpegUtil::ReSampler reSampler(inAudio, outAudio);
 
   AudioData audioData{fmt_ctx, acodec_ctx, &reSampler};
 
@@ -242,26 +240,13 @@ void playAudio(AVFormatContext* fmt_ctx, AVCodecContext* acodec_ctx,
     throw std::runtime_error(errMsg);
   }
 
-  cout << "wanted_specs.freq:" << audio_spec.freq << endl;
-  // cout << "wanted_specs.format:" << wanted_specs.format << endl;
-  std::printf("wanted_specs.format: Ox%X\n", audio_spec.format);
-  cout << "wanted_specs.channels:" << (int)audio_spec.channels << endl;
-  cout << "wanted_specs.samples:" << (int)audio_spec.samples << endl;
-
-  cout << "------------------------------------------------" << endl;
-  cout << "specs.freq:" << spec.freq << endl;
-  // cout << "specs.format:" << specs.format << endl;
-  std::printf("specs.format: Ox%X\n", spec.format);
-  cout << "specs.channels:" << (int)spec.channels << endl;
-  cout << "specs.silence:" << (int)spec.silence << endl;
-  cout << "specs.samples:" << (int)spec.samples << endl;
   SDL_PauseAudioDevice(audioDeviceID, 0);
   cout << "waiting audio play..." << endl;
 
 }
 
-void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
-               AudioProcessor* audio = nullptr) {
+void playVideo(AVCodecContext* vcodec_ctx, VideoDealer& vd,
+               AudioDealer* ad = nullptr) {
   int ret = 0;
   AVFrame* frame = av_frame_alloc();
   AVPacket* pkt = av_packet_alloc();
@@ -301,7 +286,7 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
     throw "Failed to create a texture!";
   }
 
-  auto frame_rate = vProcessor.getFrameRate();
+  auto frame_rate = vd.getFrameRate();
   
   cout << "fr1: " << frame_rate << "fr2: " << (int)(1000 / frame_rate) << endl;
   video_thread = SDL_CreateThread(refresh_thread, "Refresh", &frame_rate);
@@ -345,25 +330,25 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
       //  }
       //}
 
-       if (vProcessor.isStreamFinished()) {
+       if (vd.isStreamFinished()) {
         thread_quit = true;
         continue;  // skip REFRESH event.
       }
 
-      if (audio != nullptr) {
-        auto vTs = vProcessor.getPts();
-        auto aTs = audio->getPts();
+      if (ad != nullptr) {
+        auto vTs = vd.get_ts();
+        auto aTs = ad->get_ts();
         //cout << "vTs: " << vTs << "aTs: " << aTs << endl;
         if (vTs > aTs && vTs - aTs > 30) {
-          cout << "VIDEO IS FASTER ================= " << (vTs - aTs)
-               << "ms, SKIP A EVENT" << endl;
+          //cout << "VIDEO IS FASTER ================= " << (vTs - aTs)
+          //     << "ms, SKIP A EVENT" << endl;
           // skip a REFRESH_EVENT
           faster.store(false);
           slowCount++;
           continue;
         } else if (vTs < aTs && aTs - vTs > 30) {
-          cout << "VIDEO IS SLOWER ================= " << (aTs - vTs)
-               << "ms, Faster" << endl;
+          //cout << "VIDEO IS SLOWER ================= " << (aTs - vTs)
+          //    << "ms, Faster" << endl;
           faster.store(true);
           fastCount++;
         } else {
@@ -372,7 +357,7 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
       } else
         cout << "no audio processor" << endl;
 
-      AVFrame* frame = vProcessor.getFrame();
+      AVFrame* frame = vd.getFrame();
 
       if (frame != nullptr) {
         SDL_UpdateYUVTexture(texture, NULL,
@@ -383,8 +368,8 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
         SDL_RenderClear(render);
         SDL_RenderCopy(render, texture, NULL, NULL);
         SDL_RenderPresent(render);
-        if (!vProcessor.refreshFrame()) {
-          cout << "WARN: vProcessor.refreshFrame false" << endl;
+        if (!vd.refreshFrame()) {
+          cout << "WARN: video dealer failed to refresh frame " << endl;
         }
       } else {
         failCount++;
@@ -400,6 +385,7 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoProcessor& vProcessor,
       break;
     }
   }
+
 _Quit:
   av_frame_free(&frame);
   av_packet_free(&pkt);
@@ -410,52 +396,13 @@ _Quit:
 }
 
 int play_video(string path) {
-  int ret = 0;
 
-  AVFormatContext* fmt_ctx = avformat_alloc_context();
-  AVCodecParameters* vcodec_par = nullptr;
-  AVCodecContext* vcodec_ctx = nullptr;
+  FFmpegUtil::ffmpeg_util ffmpeg_ctx(path);
 
-  AVCodecParameters* acodec_par = nullptr;
-  AVCodecContext* acodec_ctx = nullptr;
+  VideoDealer vd(ffmpeg_ctx);
 
-  av_log_set_level(AV_LOG_INFO);
+  AudioDealer ad(ffmpeg_ctx);
 
-  avformat_network_init();
-
-  // print info
-  ret = avformat_open_input(&fmt_ctx, path.c_str(), NULL, NULL);
-  if (ret < 0) {
-    av_strerror(ret, errors, 1024);
-    av_log(NULL, AV_LOG_ERROR, "can't open file: %s, %d(%s)\n", path, ret,
-           errors);
-    throw "can't open file:" + path;
-    return -1;
-  }
-
-  av_dump_format(fmt_ctx, 0, path.c_str(), 0);
-
-  // 2.get stream
-  ret = avformat_find_stream_info(fmt_ctx, NULL);
-  if (ret < 0) {
-    av_strerror(ret, errors, 1024);
-    av_log(NULL, AV_LOG_ERROR, "Can't find stream info: %s, %d(%s)\n", path,
-           ret, errors);
-    avformat_close_input(&fmt_ctx);
-    return -1;
-  }
-
-  AudioUtil::get_codec_ctx(fmt_ctx, &video_stream_index, &vcodec_ctx,
-                           AVMEDIA_TYPE_VIDEO);
-  AudioUtil::get_codec_ctx(fmt_ctx, &audio_stream_index, &acodec_ctx,
-                           AVMEDIA_TYPE_AUDIO);
-
-  VideoProcessor videoProcessor(fmt_ctx);
-  videoProcessor.start();
-
-  // create AudioProcessor
-  AudioProcessor audioProcessor(fmt_ctx);
-  audioProcessor.start();
 
   SDL_setenv("SDL_AUDIO_ALSA_SET_BUFFER_SIZE", "1", 1);
 
@@ -465,49 +412,28 @@ int play_video(string path) {
     return -1;
   }
 
-  // Uint32 audio device id
   SDL_AudioDeviceID audioDeviceID;
 
-  //playAudio(fmt_ctx, acodec_ctx, audioDeviceID);
+  std::thread grab_thread{packet_grabber, ffmpeg_ctx, &ad, &vd};
 
-  //playVideo( vcodec_ctx);
+  grab_thread.detach();
 
-  // start pkt reader
-  std::thread readerThread{pktReader, fmt_ctx, &audioProcessor,
-                           &videoProcessor};
+  std::thread audio_thread(playAudio, ffmpeg_ctx, std::ref(audioDeviceID), std::ref(ad));
+  std::thread video_thread(playVideo, ffmpeg_ctx.get_vcodec_ctx(), std::ref(vd), &ad);
 
-  std::thread audioThread(playAudio, fmt_ctx, acodec_ctx,
-                          std::ref(audioDeviceID), std::ref(audioProcessor));
-  audioThread.join();
+  audio_thread.join();
+  video_thread.join();
 
-  std::thread videoThread(playVideo, vcodec_ctx, std::ref(videoProcessor),
-                          &audioProcessor);
-
-  videoThread.join();
+  ad.close();
+  vd.close();
 
 
-  //SDL_Delay(30000);
   SDL_PauseAudioDevice(audioDeviceID, 1);
   SDL_CloseAudio();
-
-
-  audioProcessor.close();
-  videoProcessor.close();
-
-  readerThread.join();
-   
-
-_Quit:
-  ret = 0;
-
-  
-  avcodec_close(vcodec_ctx);
-  avcodec_free_context(&vcodec_ctx);
-  avcodec_close(acodec_ctx);
-  avcodec_free_context(&acodec_ctx);
-  avformat_close_input(&fmt_ctx);
   
   SDL_Quit();
+  //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
 
   return 0;
 }

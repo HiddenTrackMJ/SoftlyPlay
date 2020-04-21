@@ -1,52 +1,100 @@
-#include "audioUtil.h"
+#include "FFmpegUtil.h"
 
 
 
-#include <list>
+#include <deque>
 #include <memory>
 #include <chrono>
-
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 
 
 
-using std::condition_variable;
+
+
 using std::cout;
 using std::endl;
-using std::list;
-using std::mutex;
+
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 
-class MediaProcessor {
-  list<unique_ptr<AVPacket>> packetList{};
-  mutex pktListMutex{};
+class Dealer {
+  AVFrame* next_frame = av_frame_alloc();
+  AVPacket* current_pkt = nullptr;
+  std::deque<unique_ptr<AVPacket>> pkt_queue{};
+  std::mutex pkt_mutex{};
+
   int PKT_WAITING_SIZE = 3;
   bool started = false;
   bool closed = false;
-  bool streamFinished = false;
+  bool stream_finished = false;
+  char errors[1024];
 
-  AVFrame* nextFrame = av_frame_alloc();
-  AVPacket* targetPkt = nullptr;
 
-  void nextFrameKeeper() {
-    auto lastPrepareTime = std::chrono::system_clock::now();
-    while (!streamFinished && started) {
-      std::unique_lock<std::mutex> lk{nextDataMutex};
-      cv.wait(lk, [this] { return !started || !isNextDataReady.load(); });
-      if (!started) {
-        break;
+  void frame_decoder() {
+   
+    while (!stream_finished && started) {
+      std::unique_lock<std::mutex> locker{nextDataMutex};
+      cv.wait(locker, [this] { return !started || !next_ready; });
+      while (!stream_finished) {
+        if (current_pkt == nullptr) {
+          if (!pkt_empty) {
+            auto pkt = get_next_pkt();
+            if (pkt != nullptr) {
+              current_pkt = pkt.release();
+            } else if (pkt_empty) {
+              current_pkt = nullptr;
+            } else {
+              return;
+            }
+          } else {
+            cout << "There are no more pkt index=" << stream_index
+                 << " finished=" << stream_finished << endl;
+          }
+        }
+
+        int ret = -1;
+        ret = avcodec_send_packet(codec_ctx, current_pkt);
+        if (ret == 0) {
+          av_packet_free(&current_pkt);
+          current_pkt = nullptr;
+        } else if (ret == AVERROR(EAGAIN)) {
+          cout << "[WARN]  Buffer full. index="
+               << stream_index << endl;
+        } else if (ret == AVERROR_EOF) {
+          cout << "[WARN]  no new packets can be sent to it. index="
+               << stream_index << endl;
+        } else {
+          av_strerror(ret, errors, 1024);
+          string err(errors);
+          err = "Failed to avcodec_send_packet, " + err + "errCode: ";
+          err += ret;
+          av_log(NULL, AV_LOG_ERROR, err.c_str());
+          throw std::runtime_error(err);
+        }
+
+        ret = avcodec_receive_frame(codec_ctx, next_frame);
+        if (ret == 0) {
+          generateNextData(next_frame);
+          next_ready = true;
+        } else if (ret == AVERROR_EOF) {
+          cout << "Dealer no more output frames. index=" << stream_index << endl;
+          stream_finished = true;
+        } else if (ret == AVERROR(EAGAIN)) {
+          cout << "[WARN]  Need more pkt. index=" << stream_index << endl;
+        } else {
+          av_strerror(ret, errors, 1024);
+          string err(errors);
+          err = "Failed to avcodec_receive_frame, " + err + "errCode: ";
+          err += ret;
+          av_log(NULL, AV_LOG_ERROR, err.c_str());
+          throw std::runtime_error(err);
+        }
       }
-      auto prepareTime = std::chrono::system_clock::now();
-      std::chrono::duration<double> diff = prepareTime - lastPrepareTime;
-      lastPrepareTime = prepareTime;
-
-      prepareNextData();
     }
-    cout << "[THREAD] next frame keeper finished, index=" << streamIndex
+    cout << "[THREAD] next frame keeper finished, index=" << stream_index
          << endl;
     started = false;
     closed = true;
@@ -55,121 +103,71 @@ class MediaProcessor {
  protected:
   std::atomic<uint64_t> currentTimestamp{0};
   std::atomic<uint64_t> nextFrameTimestamp{0};
-  AVRational streamTimeBase{1, 0};
-  bool noMorePkt = false;
+  AVRational stream_time_base{1, 0};
 
-  int streamIndex = -1;
-  AVCodecContext* codecCtx = nullptr;
 
-  condition_variable cv{};
-  mutex nextDataMutex{};
+  bool pkt_empty = false;
 
-  std::atomic<bool> isNextDataReady{false};
+  int stream_index = -1;
+  AVCodecContext* codec_ctx = nullptr;
+
+ 
+  std::condition_variable cv{};
+  std::mutex nextDataMutex{};
+
+  bool next_ready{false};
 
   virtual void generateNextData(AVFrame* f) = 0;
 
-  unique_ptr<AVPacket> getNextPkt() {
-    if (noMorePkt) {
+  unique_ptr<AVPacket> get_next_pkt() {
+    if (pkt_empty) {
       return nullptr;
     }
-    std::lock_guard<std::mutex> lg(pktListMutex);
-    if (packetList.empty()) {
+    std::lock_guard<std::mutex> lg(pkt_mutex);
+    if (pkt_queue.empty()) {
       return nullptr;
     } else {
-      auto pkt = std::move(packetList.front());
+      auto pkt = std::move(pkt_queue.front());
       if (pkt == nullptr) {
-        noMorePkt = true;
-        return nullptr;
+        pkt_empty = true;
+        return pkt;
       } else {
-        packetList.pop_front();
+        pkt_queue.pop_front();
         return pkt;
       }
     }
   }
 
   void prepareNextData() {
-    while (!isNextDataReady.load() && !streamFinished) {
-      if (targetPkt == nullptr) {
-        if (!noMorePkt) {
-          auto pkt = getNextPkt();
-          if (pkt != nullptr) {
-            targetPkt = pkt.release();
-          } else if (noMorePkt) {
-            targetPkt = nullptr;
-          } else {
-            return;
-          }
-        } else {
-          // no more pkt.
-          cout << "++++++++ no more pkt index=" << streamIndex
-               << " finished=" << streamFinished << endl;
-        }
-      }
-
-      int ret = -1;
-      ret = avcodec_send_packet(codecCtx, targetPkt);
-      if (ret == 0) {
-        av_packet_free(&targetPkt);
-        targetPkt = nullptr;
-      } else if (ret == AVERROR(EAGAIN)) {
-        // buff full, can not decode any more, nothing need to do.
-        // keep the packet for next time decode.
-      } else if (ret == AVERROR_EOF) {
-        // no new packets can be sent to it, it is safe.
-        cout << "[WARN]  no new packets can be sent to it. index="
-             << streamIndex << endl;
-      } else {
-        string errorMsg = "+++++++++ ERROR avcodec_send_packet error: ";
-        errorMsg += ret;
-        cout << errorMsg << endl;
-        throw std::runtime_error(errorMsg);
-      }
-
-      ret = avcodec_receive_frame(codecCtx, nextFrame);
-      if (ret == 0) {
-        generateNextData(nextFrame);
-        isNextDataReady.store(true);
-      } else if (ret == AVERROR_EOF) {
-        cout << "+++++++++++++++++++++++++++++ MediaProcessor no more output "
-                "frames. index="
-             << streamIndex << endl;
-        streamFinished = true;
-      } else if (ret == AVERROR(EAGAIN)) {
-        // need more packet.
-      } else {
-        string errorMsg = "avcodec_receive_frame error: ";
-        errorMsg += ret;
-        cout << errorMsg << endl;
-        throw std::runtime_error(errorMsg);
-      }
-    }
+    
   }
 
  public:
-  ~MediaProcessor() {
-    if (nextFrame != nullptr) {
-      av_frame_free(&nextFrame);
+  ~Dealer() {
+    if (next_frame != nullptr) {
+      av_frame_free(&next_frame);
     }
 
-    if (targetPkt != nullptr) {
-      av_packet_free(&targetPkt);
+    if (current_pkt != nullptr) {
+      av_packet_free(&current_pkt);
     }
 
-    if (codecCtx != nullptr) {
-      avcodec_free_context(&codecCtx);
+    if (codec_ctx != nullptr) {
+      avcodec_free_context(&codec_ctx);
     }
 
     // very important here.
-    for (auto& p : packetList) {
+    for (auto& p : pkt_queue) {
       auto pkt = p.release();
       av_packet_free(&pkt);
     }
 
-    cout << "~MediaProcessor called. index=" << streamIndex << endl;
+    cout << "~Dealer() called. index=" << stream_index << endl;
   }
+
   void start() {
     started = true;
-    std::thread keeper{&MediaProcessor::nextFrameKeeper, this};
+    std::thread keeper{&Dealer::frame_decoder, this};
     keeper.detach();
   }
 
@@ -187,185 +185,157 @@ class MediaProcessor {
   bool isClosed() { return closed; }
 
   void pushPkt(unique_ptr<AVPacket> pkt) {
-    std::lock_guard<std::mutex> lg(pktListMutex);
-    packetList.push_back(std::move(pkt));
+    std::lock_guard<std::mutex> lg(pkt_mutex);
+    pkt_queue.push_back(std::move(pkt));
   }
-  bool isStreamFinished() { return streamFinished; }
+  bool isStreamFinished() { return stream_finished; }
 
   bool needPacket() {
     bool need;
-    std::lock_guard<std::mutex> lg(pktListMutex);
-    need = packetList.size() < PKT_WAITING_SIZE;
+    std::lock_guard<std::mutex> lg(pkt_mutex);
+    need = pkt_queue.size() < PKT_WAITING_SIZE;
     return need;
   }
 
-  AVCodecContext* getCodecCtx() { return codecCtx; }
+  AVCodecContext* getCodecCtx() { return codec_ctx; }
 
-  uint64_t getPts() { return currentTimestamp.load(); }
+  uint64_t get_ts() { return currentTimestamp.load(); }
 };
 
-class AudioProcessor : public MediaProcessor {
-  std::unique_ptr<AudioUtil::ReSampler> reSampler{};
+class AudioDealer : public Dealer {
+  std::unique_ptr<FFmpegUtil::ReSampler> reSampler{};
 
-  uint8_t* outBuffer = nullptr;
-  int outBufferSize = -1;
-  int outDataSize = -1;
-  int outSamples = -1;
+  uint8_t* out_buffer = nullptr;
+  int out_buffer_size = -1;
+  int out_data_size = -1;
+  int out_samples = -1;
 
-  AudioUtil::AudioInfo inAudio;
-  AudioUtil::AudioInfo outAudio;
+  FFmpegUtil::AudioInfo in_audio;
+  FFmpegUtil::AudioInfo out_audio;
+  FFmpegUtil::ffmpeg_util ff_util;
 
- protected:
+protected:
   void generateNextData(AVFrame* frame) final override {
-    if (outBuffer == nullptr) {
-      outBufferSize = reSampler->allocDataBuf(&outBuffer, frame->nb_samples);
+    if (out_buffer == nullptr) {
+      out_buffer_size = reSampler->allocDataBuf(&out_buffer, frame->nb_samples);
     } else {
-      memset(outBuffer, 0, outBufferSize);
+      memset(out_buffer, 0, out_buffer_size);
     }
-    std::tie(outSamples, outDataSize) = reSampler->reSample(outBuffer, outBufferSize, frame);
-    auto t = frame->pts * av_q2d(streamTimeBase) * 1000;
-    //cout << "at: " << t << "64: " << frame->pts << endl;
+    std::tie(out_samples, out_data_size) = reSampler->reSample(out_buffer, out_buffer_size, frame);
+    auto t = frame->pts * av_q2d(stream_time_base) * 1000;
     nextFrameTimestamp.store((uint64_t)t);
   }
 
  public:
-  AudioProcessor(const AudioProcessor&) = delete;
-  AudioProcessor(AudioProcessor&&) noexcept = delete;
-  AudioProcessor operator=(const AudioProcessor&) = delete;
-  ~AudioProcessor() {
-    if (outBuffer != nullptr) {
-      av_freep(&outBuffer);
+
+  ~AudioDealer() {
+    if (out_buffer != nullptr) {
+      av_freep(&out_buffer);
     }
-    cout << "~AudioProcessor() called." << endl;
+    cout << "~AudioDealer() called." << endl;
   }
 
-  AudioProcessor(AVFormatContext* formatCtx) {
-   
-    AudioUtil::get_codec_ctx(formatCtx, &streamIndex, &codecCtx,
-                             AVMEDIA_TYPE_AUDIO);
-    if (streamIndex < 0) {
-      cout << "WARN: can not find audio stream." << endl;
-    }
+  AudioDealer(FFmpegUtil::ffmpeg_util f) : ff_util(f) {
+    codec_ctx = f.get_acodec_ctx();
+    stream_index = f.get_audio_index();
+    stream_time_base = f.get_audio_base();
 
-    streamTimeBase = formatCtx->streams[streamIndex]->time_base;
+    int64_t inLayout = codec_ctx->channel_layout;
+    int inSampleRate = codec_ctx->sample_rate;
+    int inChannels = codec_ctx->channels;
+    AVSampleFormat inFormat = codec_ctx->sample_fmt;
 
-    int64_t inLayout = codecCtx->channel_layout;
-    int inSampleRate = codecCtx->sample_rate;
-    int inChannels = codecCtx->channels;
-    AVSampleFormat inFormat = codecCtx->sample_fmt;
+    in_audio =  FFmpegUtil::AudioInfo(inLayout, inSampleRate, inChannels, inFormat);
+    out_audio = FFmpegUtil::ReSampler::getDefaultAudioInfo(inSampleRate);
 
-    inAudio =
-        AudioUtil::AudioInfo(inLayout, inSampleRate, inChannels, inFormat);
-    outAudio = AudioUtil::ReSampler::getDefaultAudioInfo(inSampleRate);
-
-    reSampler.reset(new AudioUtil::ReSampler(inAudio, outAudio));
+    reSampler.reset(new FFmpegUtil::ReSampler(in_audio, out_audio));
+    start();
   }
 
-  int getAudioIndex() const { return streamIndex; }
 
-  int getSamples() { return outSamples; }
+  int getSamples() { return out_samples; }
 
-  void writeAudioData(uint8_t* stream, int len) {
-    static uint8_t* silenceBuff = nullptr;
-    if (silenceBuff == nullptr) {
-      silenceBuff = (uint8_t*)av_malloc(sizeof(uint8_t) * len);
-      std::memset(silenceBuff, 0, len);
+  void write_audio_data(uint8_t* stream, int len) {
+    static uint8_t* silence_buff = nullptr;
+    if (silence_buff == nullptr) {
+      silence_buff = (uint8_t*)av_malloc(sizeof(uint8_t) * len);
+      std::memset(silence_buff, 0, len);
     }
 
-    if (isNextDataReady.load()) {
-      std::lock_guard<std::mutex> lock(nextDataMutex);
+    if (next_ready) {
+      std::lock_guard<std::mutex> locker(nextDataMutex);
       currentTimestamp.store(nextFrameTimestamp.load());
-      if (outDataSize != len) {
-        cout << "WARNING: outDataSize[" << outDataSize << "] != len[" << len
+      if (out_data_size != len) {
+        cout << "WARNING: outDataSize[" << out_data_size << "] != len[" << len
              << "]" << endl;
       }
-      std::memcpy(stream, outBuffer, outDataSize);
-      isNextDataReady.store(false);
+      std::memcpy(stream, out_buffer, out_data_size);
+      next_ready = false;
     } else {
-      // if list is empty, silent will be written.
       cout << "WARNING: writeAudioData, audio data not ready." << endl;
-      std::memcpy(stream, silenceBuff, len);
+      std::memcpy(stream, silence_buff, len);
     }
     cv.notify_one();
   }
 
 
-  int getOutChannels() const { return outAudio.channels; }
-
-  int getOutChannleLayout() const { return outAudio.layout; }
-
-  int getInSampleRate() const {
-    if (codecCtx != nullptr) {
-      return codecCtx->sample_rate;
-    } else {
-      throw std::runtime_error("can not getSampleRate.");
-    }
-  }
-
-  int getOutSampleRate() const { return outAudio.sampleRate; }
-
-
 };
 
-class VideoProcessor : public MediaProcessor {
+class VideoDealer : public Dealer {
   struct SwsContext* sws_ctx = nullptr;
-  AVFrame* outPic = nullptr;
+  AVFrame* out_pic = nullptr;
+  FFmpegUtil::ffmpeg_util ff_util;
 
  protected:
   void generateNextData(AVFrame* frame) override {
-    auto t = frame->pts * av_q2d(streamTimeBase) * 1000;
-    //cout << "vt: " << t << "64: " << frame->pts << endl;
+    auto t = frame->pts * av_q2d(stream_time_base) * 1000;
     nextFrameTimestamp.store((uint64_t)t);
     sws_scale(sws_ctx, (uint8_t const* const*)frame->data, frame->linesize, 0,
-              codecCtx->height, outPic->data, outPic->linesize);
-    // unlock nextFrame
+              codec_ctx->height, out_pic->data, out_pic->linesize);
+
   }
 
  public:
-  VideoProcessor(const VideoProcessor&) = delete;
-  VideoProcessor(VideoProcessor&&) noexcept = delete;
-  VideoProcessor operator=(const VideoProcessor&) = delete;
-  ~VideoProcessor() {
+ 
+  ~VideoDealer() {
     if (sws_ctx != nullptr) {
       sws_freeContext(sws_ctx);
       sws_ctx = nullptr;
     }
 
-    if (outPic != nullptr) {
-      av_frame_free(&outPic);
+    if (out_pic != nullptr) {
+      av_frame_free(&out_pic);
     }
-    cout << "~VideoProcessor() called." << endl;
+
+    ff_util.close();
+    cout << "~VideoDealer() called." << endl;
   }
 
-  VideoProcessor(AVFormatContext* formatCtx) {
-    AudioUtil::get_codec_ctx(formatCtx, &streamIndex, &codecCtx,
-                             AVMEDIA_TYPE_VIDEO);
+  VideoDealer(FFmpegUtil::ffmpeg_util f) : ff_util(f)
+  {
+   
+    codec_ctx = f.get_vcodec_ctx();
+    stream_index = f.get_video_index();
+    stream_time_base = f.get_video_base();
 
-    if (streamIndex < 0) {
-      cout << "WARN: can not find video stream." << endl;
-    }
+    int w = codec_ctx->width;
+    int h = codec_ctx->height;
 
-    streamTimeBase = formatCtx->streams[streamIndex]->time_base;
-
-    int w = codecCtx->width;
-    int h = codecCtx->height;
-
-    sws_ctx = sws_getContext(w, h, codecCtx->pix_fmt, w, h, AV_PIX_FMT_YUV420P,
+    sws_ctx = sws_getContext(w, h, codec_ctx->pix_fmt, w, h, AV_PIX_FMT_YUV420P,
                              SWS_BILINEAR, NULL, NULL, NULL);
 
     int numBytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, w, h, 32);
-    outPic = av_frame_alloc();
+    out_pic = av_frame_alloc();
     uint8_t* buffer = (uint8_t*)av_malloc(numBytes * sizeof(uint8_t));
-    av_image_fill_arrays(outPic->data, outPic->linesize, buffer,
+    av_image_fill_arrays(out_pic->data, out_pic->linesize, buffer,
                          AV_PIX_FMT_YUV420P, w, h, 32);
+    start();
   }
 
-  int getVideoIndex() const { return streamIndex; }
-
   AVFrame* getFrame() {
-    if (isNextDataReady.load()) {
+    if (next_ready) {
       currentTimestamp.store(nextFrameTimestamp.load());
-      return outPic;
+      return out_pic;
     } else {
       cout << "WARNING: getFrame, video data not ready." << endl;
       return nullptr;
@@ -373,9 +343,9 @@ class VideoProcessor : public MediaProcessor {
   }
 
   bool refreshFrame() {
-    if (isNextDataReady.load()) {
+    if (next_ready) {
       currentTimestamp.store(nextFrameTimestamp.load());
-      isNextDataReady.store(false);
+      next_ready = false;
       cv.notify_one();
       return true;
     } else {
@@ -385,8 +355,8 @@ class VideoProcessor : public MediaProcessor {
   }
 
   double getFrameRate() const {
-    if (codecCtx != nullptr) {
-      auto frameRate = codecCtx->framerate;
+    if (codec_ctx != nullptr) {
+      auto frameRate = codec_ctx->framerate;
       double fr = frameRate.num && frameRate.den ? av_q2d(frameRate) : 0.0;
       return fr;
     } else {
