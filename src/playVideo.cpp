@@ -180,10 +180,10 @@ void packet_grabber(FFmpegUtil::ffmpeg_util f, AudioDealer* ad,
         vd->pushPkt(nullptr);
         break;
       } else if (t == audio_index && ad != nullptr) {
-        unique_ptr<AVPacket> uPacket(packet);
+        std::unique_ptr<AVPacket> uPacket(packet);
         ad->pushPkt(std::move(uPacket));
       } else if (t == video_index && vd != nullptr) {
-        unique_ptr<AVPacket> uPacket(packet);
+        std::unique_ptr<AVPacket> uPacket(packet);
         vd->pushPkt(std::move(uPacket));
       } else {
         av_packet_free(&packet);
@@ -286,7 +286,7 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoDealer& vd,
     throw "Failed to create a texture!";
   }
 
-  auto frame_rate = vd.getFrameRate();
+  auto frame_rate = vd.get_frame_rate();
   
   cout << "fr1: " << frame_rate << "fr2: " << (int)(1000 / frame_rate) << endl;
   video_thread = SDL_CreateThread(refresh_thread, "Refresh", &frame_rate);
@@ -357,7 +357,7 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoDealer& vd,
       } else
         cout << "no audio processor" << endl;
 
-      AVFrame* frame = vd.getFrame();
+      AVFrame* frame = vd.get_frame();
 
       if (frame != nullptr) {
         SDL_UpdateYUVTexture(texture, NULL,
@@ -368,7 +368,7 @@ void playVideo(AVCodecContext* vcodec_ctx, VideoDealer& vd,
         SDL_RenderClear(render);
         SDL_RenderCopy(render, texture, NULL, NULL);
         SDL_RenderPresent(render);
-        if (!vd.refreshFrame()) {
+        if (!vd.refresh()) {
           cout << "WARN: video dealer failed to refresh frame " << endl;
         }
       } else {

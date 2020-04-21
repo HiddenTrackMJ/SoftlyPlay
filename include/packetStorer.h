@@ -1,7 +1,5 @@
 #include "FFmpegUtil.h"
 
-
-
 #include <deque>
 #include <memory>
 #include <chrono>
@@ -10,41 +8,33 @@
 #include <mutex>
 
 
-
-
-
 using std::cout;
 using std::endl;
-
-using std::shared_ptr;
 using std::string;
-using std::unique_ptr;
 
 class Dealer {
   AVFrame* next_frame = av_frame_alloc();
   AVPacket* current_pkt = nullptr;
-  std::deque<unique_ptr<AVPacket>> pkt_queue{};
+  std::deque<std::unique_ptr<AVPacket>> pkt_queue{};
   std::mutex pkt_mutex{};
 
+  char errors[1024];
   int PKT_WAITING_SIZE = 3;
   bool started = false;
   bool closed = false;
   bool stream_finished = false;
-  char errors[1024];
-
 
   void frame_decoder() {
-   
     while (!stream_finished && started) {
-      std::unique_lock<std::mutex> locker{nextDataMutex};
-      cv.wait(locker, [this] { return !started || !next_ready; });
-      while (!stream_finished) {
+      std::unique_lock<std::mutex> locker{next_data_mutex};
+      cv.wait(locker, [this] { return !started || !next_ready.load(); });
+      while (!next_ready.load() && !stream_finished) {
         if (current_pkt == nullptr) {
-          if (!pkt_empty) {
+          if (!noMorePkt) {
             auto pkt = get_next_pkt();
             if (pkt != nullptr) {
               current_pkt = pkt.release();
-            } else if (pkt_empty) {
+            } else if (noMorePkt) {
               current_pkt = nullptr;
             } else {
               return;
@@ -55,14 +45,13 @@ class Dealer {
           }
         }
 
-        int ret = -1;
+         int ret = -1;
         ret = avcodec_send_packet(codec_ctx, current_pkt);
         if (ret == 0) {
           av_packet_free(&current_pkt);
           current_pkt = nullptr;
         } else if (ret == AVERROR(EAGAIN)) {
-          cout << "[WARN]  Buffer full. index="
-               << stream_index << endl;
+          cout << "[WARN]  Buffer full. index=" << stream_index << endl;
         } else if (ret == AVERROR_EOF) {
           cout << "[WARN]  no new packets can be sent to it. index="
                << stream_index << endl;
@@ -77,10 +66,11 @@ class Dealer {
 
         ret = avcodec_receive_frame(codec_ctx, next_frame);
         if (ret == 0) {
-          generateNextData(next_frame);
+          gen_next_data(next_frame);
           next_ready = true;
         } else if (ret == AVERROR_EOF) {
-          cout << "Dealer no more output frames. index=" << stream_index << endl;
+          cout << "Dealer no more output frames. index=" << stream_index
+               << endl;
           stream_finished = true;
         } else if (ret == AVERROR(EAGAIN)) {
           cout << "[WARN]  Need more pkt. index=" << stream_index << endl;
@@ -104,33 +94,31 @@ class Dealer {
   std::atomic<uint64_t> currentTimestamp{0};
   std::atomic<uint64_t> nextFrameTimestamp{0};
   AVRational stream_time_base{1, 0};
-
-
-  bool pkt_empty = false;
+  bool noMorePkt = false;
 
   int stream_index = -1;
   AVCodecContext* codec_ctx = nullptr;
 
  
   std::condition_variable cv{};
-  std::mutex nextDataMutex{};
+  std::mutex next_data_mutex{};
 
-  bool next_ready{false};
+  std::atomic<bool> next_ready{false};
 
-  virtual void generateNextData(AVFrame* f) = 0;
+  virtual void gen_next_data(AVFrame* f) = 0;
 
-  unique_ptr<AVPacket> get_next_pkt() {
-    if (pkt_empty) {
+  std::unique_ptr<AVPacket> get_next_pkt() {
+    if (noMorePkt) {
       return nullptr;
     }
-    std::lock_guard<std::mutex> lg(pkt_mutex);
+    std::lock_guard<std::mutex> locker(pkt_mutex);
     if (pkt_queue.empty()) {
       return nullptr;
     } else {
       auto pkt = std::move(pkt_queue.front());
       if (pkt == nullptr) {
-        pkt_empty = true;
-        return pkt;
+        noMorePkt = true;
+        return nullptr;
       } else {
         pkt_queue.pop_front();
         return pkt;
@@ -138,9 +126,6 @@ class Dealer {
     }
   }
 
-  void prepareNextData() {
-    
-  }
 
  public:
   ~Dealer() {
@@ -184,7 +169,7 @@ class Dealer {
 
   bool isClosed() { return closed; }
 
-  void pushPkt(unique_ptr<AVPacket> pkt) {
+  void pushPkt(std::unique_ptr<AVPacket> pkt) {
     std::lock_guard<std::mutex> lg(pkt_mutex);
     pkt_queue.push_back(std::move(pkt));
   }
@@ -197,7 +182,7 @@ class Dealer {
     return need;
   }
 
-  AVCodecContext* getCodecCtx() { return codec_ctx; }
+  AVCodecContext* get_codec_ctx() { return codec_ctx; }
 
   uint64_t get_ts() { return currentTimestamp.load(); }
 };
@@ -215,7 +200,7 @@ class AudioDealer : public Dealer {
   FFmpegUtil::ffmpeg_util ff_util;
 
 protected:
-  void generateNextData(AVFrame* frame) final override {
+  void gen_next_data(AVFrame* frame) final override {
     if (out_buffer == nullptr) {
       out_buffer_size = reSampler->allocDataBuf(&out_buffer, frame->nb_samples);
     } else {
@@ -262,17 +247,17 @@ protected:
       std::memset(silence_buff, 0, len);
     }
 
-    if (next_ready) {
-      std::lock_guard<std::mutex> locker(nextDataMutex);
+    if (next_ready.load()) {
+      std::lock_guard<std::mutex> locker(next_data_mutex);
       currentTimestamp.store(nextFrameTimestamp.load());
       if (out_data_size != len) {
-        cout << "WARNING: outDataSize[" << out_data_size << "] != len[" << len
+        cout << "WARNING: out_data_size[" << out_data_size << "] != len[" << len
              << "]" << endl;
       }
       std::memcpy(stream, out_buffer, out_data_size);
-      next_ready = false;
+      next_ready.store(false);
     } else {
-      cout << "WARNING: writeAudioData, audio data not ready." << endl;
+      cout << "WARNING: write_audio_data, audio data not ready." << endl;
       std::memcpy(stream, silence_buff, len);
     }
     cv.notify_one();
@@ -283,16 +268,15 @@ protected:
 
 class VideoDealer : public Dealer {
   struct SwsContext* sws_ctx = nullptr;
-  AVFrame* out_pic = nullptr;
+  AVFrame* out_frame = nullptr;
   FFmpegUtil::ffmpeg_util ff_util;
 
  protected:
-  void generateNextData(AVFrame* frame) override {
+  void gen_next_data(AVFrame* frame) override {
     auto t = frame->pts * av_q2d(stream_time_base) * 1000;
     nextFrameTimestamp.store((uint64_t)t);
     sws_scale(sws_ctx, (uint8_t const* const*)frame->data, frame->linesize, 0,
-              codec_ctx->height, out_pic->data, out_pic->linesize);
-
+              codec_ctx->height, out_frame->data, out_frame->linesize);
   }
 
  public:
@@ -303,8 +287,8 @@ class VideoDealer : public Dealer {
       sws_ctx = nullptr;
     }
 
-    if (out_pic != nullptr) {
-      av_frame_free(&out_pic);
+    if (out_frame != nullptr) {
+      av_frame_free(&out_frame);
     }
 
     ff_util.close();
@@ -325,27 +309,27 @@ class VideoDealer : public Dealer {
                              SWS_BILINEAR, NULL, NULL, NULL);
 
     int numBytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, w, h, 32);
-    out_pic = av_frame_alloc();
+    out_frame = av_frame_alloc();
     uint8_t* buffer = (uint8_t*)av_malloc(numBytes * sizeof(uint8_t));
-    av_image_fill_arrays(out_pic->data, out_pic->linesize, buffer,
+    av_image_fill_arrays(out_frame->data, out_frame->linesize, buffer,
                          AV_PIX_FMT_YUV420P, w, h, 32);
     start();
   }
 
-  AVFrame* getFrame() {
-    if (next_ready) {
+  AVFrame* get_frame() {
+    if (next_ready.load()) {
       currentTimestamp.store(nextFrameTimestamp.load());
-      return out_pic;
+      return out_frame;
     } else {
       cout << "WARNING: getFrame, video data not ready." << endl;
       return nullptr;
     }
   }
 
-  bool refreshFrame() {
-    if (next_ready) {
+  bool refresh() {
+    if (next_ready.load()) {
       currentTimestamp.store(nextFrameTimestamp.load());
-      next_ready = false;
+      next_ready.store(false);
       cv.notify_one();
       return true;
     } else {
@@ -354,7 +338,7 @@ class VideoDealer : public Dealer {
     }
   }
 
-  double getFrameRate() const {
+  double get_frame_rate() const {
     if (codec_ctx != nullptr) {
       auto frameRate = codec_ctx->framerate;
       double fr = frameRate.num && frameRate.den ? av_q2d(frameRate) : 0.0;
